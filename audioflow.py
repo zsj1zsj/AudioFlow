@@ -1168,6 +1168,247 @@ def api_task_file_path(row: dict, kind: str) -> Path:
     return path
 
 
+def api_index_html() -> str:
+    return """<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AudioFlow</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #0f172a;
+      --panel: #111827;
+      --panel-2: #1f2937;
+      --text: #e5e7eb;
+      --muted: #9ca3af;
+      --accent: #22c55e;
+      --accent-2: #38bdf8;
+      --border: rgba(148, 163, 184, 0.22);
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: radial-gradient(circle at top, #1e293b 0, #0f172a 45%, #020617 100%);
+      color: var(--text);
+    }
+    .wrap { max-width: 960px; margin: 0 auto; padding: 24px 16px 40px; }
+    .hero {
+      background: linear-gradient(180deg, rgba(56, 189, 248, 0.18), rgba(34, 197, 94, 0.10));
+      border: 1px solid var(--border);
+      border-radius: 20px;
+      padding: 20px;
+      margin-bottom: 16px;
+      backdrop-filter: blur(12px);
+    }
+    h1 { margin: 0 0 8px; font-size: 28px; }
+    p { margin: 8px 0; color: var(--muted); line-height: 1.6; }
+    .grid { display: grid; gap: 16px; }
+    .card {
+      background: rgba(17, 24, 39, 0.84);
+      border: 1px solid var(--border);
+      border-radius: 18px;
+      padding: 16px;
+    }
+    label { display: block; margin-bottom: 8px; font-weight: 600; }
+    input, button {
+      font: inherit;
+      border-radius: 12px;
+      border: 1px solid var(--border);
+    }
+    input {
+      width: 100%;
+      padding: 14px 16px;
+      background: #0b1220;
+      color: var(--text);
+    }
+    button {
+      padding: 12px 16px;
+      background: linear-gradient(135deg, var(--accent-2), var(--accent));
+      color: #001018;
+      font-weight: 700;
+      cursor: pointer;
+    }
+    button:disabled { opacity: 0.65; cursor: progress; }
+    .row { display: grid; gap: 10px; grid-template-columns: 1fr auto; }
+    .meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 10px;
+      font-size: 13px;
+      color: var(--muted);
+    }
+    .pill {
+      padding: 4px 10px;
+      border-radius: 999px;
+      background: rgba(148, 163, 184, 0.12);
+      border: 1px solid var(--border);
+    }
+    .tasks { display: grid; gap: 12px; }
+    .task {
+      padding: 14px;
+      border-radius: 16px;
+      background: var(--panel-2);
+      border: 1px solid var(--border);
+    }
+    .task-head {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      align-items: flex-start;
+      flex-wrap: wrap;
+    }
+    .title { font-weight: 700; word-break: break-word; }
+    .small { font-size: 13px; color: var(--muted); }
+    .links { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+    .links a {
+      color: #dbeafe;
+      text-decoration: none;
+      padding: 6px 10px;
+      border-radius: 999px;
+      border: 1px solid rgba(148, 163, 184, 0.2);
+      background: rgba(15, 23, 42, 0.55);
+    }
+    .empty {
+      padding: 24px;
+      text-align: center;
+      color: var(--muted);
+      border: 1px dashed var(--border);
+      border-radius: 16px;
+    }
+    @media (max-width: 640px) {
+      .row { grid-template-columns: 1fr; }
+      h1 { font-size: 24px; }
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <section class="hero">
+      <h1>AudioFlow</h1>
+      <p>输入一个 URL，点击按钮，后台会自动下载、转录、总结并生成 Markdown。完成后直接在下面打开笔记。</p>
+      <div class="meta">
+        <span class="pill">POST /tasks</span>
+        <span class="pill">GET /tasks/{id}</span>
+        <span class="pill">GET /files/{id}?kind=markdown</span>
+      </div>
+    </section>
+
+    <div class="grid">
+      <section class="card">
+        <form id="task-form">
+          <label for="url">URL</label>
+          <div class="row">
+            <input id="url" name="url" type="url" required placeholder="https://youtu.be/..." autocomplete="off">
+            <button id="submit" type="submit">开始处理</button>
+          </div>
+        </form>
+        <p id="message">把视频或播客链接贴进来即可。</p>
+      </section>
+
+      <section class="card">
+        <div class="task-head">
+          <div>
+            <div class="title">任务列表</div>
+            <div class="small">自动刷新，完成后会显示 Markdown / Transcript / Summary / Review 链接。</div>
+          </div>
+          <button id="refresh" type="button">刷新任务</button>
+        </div>
+        <div id="tasks" class="tasks" style="margin-top: 14px;"></div>
+      </section>
+    </div>
+  </div>
+
+  <script>
+    const message = document.getElementById("message");
+    const tasksEl = document.getElementById("tasks");
+    const submit = document.getElementById("submit");
+
+    async function requestJson(url, options = {}) {
+      const response = await fetch(url, {
+        headers: { "Content-Type": "application/json", ...(options.headers || {}) },
+        ...options,
+      });
+      const text = await response.text();
+      let payload = {};
+      try { payload = text ? JSON.parse(text) : {}; } catch (_) { payload = { detail: text }; }
+      if (!response.ok) {
+        throw new Error(payload.detail || response.statusText);
+      }
+      return payload;
+    }
+
+    function link(kind, task) {
+      const href = task.files && task.files[kind];
+      if (!href) return "";
+      const label = kind === "markdown" ? "Markdown" : kind === "transcript" ? "Transcript" : kind === "summary" ? "Summary" : "Review";
+      return `<a href="${href}" target="_blank" rel="noreferrer">${label}</a>`;
+    }
+
+    function renderTask(task) {
+      const files = ["markdown", "transcript", "summary", "review"].map(kind => link(kind, task)).filter(Boolean).join("");
+      return `
+        <div class="task">
+          <div class="task-head">
+            <div>
+              <div class="title">${task.title || task.url}</div>
+              <div class="small">#${task.task_id} · ${task.status} · ${task.created_at || ""}</div>
+            </div>
+            <div class="small">${task.source || ""}</div>
+          </div>
+          <div class="small" style="margin-top:8px; word-break: break-word;">${task.url}</div>
+          <div class="links">${files || "<span class='small'>等待完成后显示文件链接</span>"}</div>
+        </div>
+      `;
+    }
+
+    async function loadTasks() {
+      const data = await requestJson("/tasks");
+      const items = (data.items || []).slice();
+      items.sort((a, b) => {
+        if (a.status === "FINISHED" && b.status !== "FINISHED") return -1;
+        if (a.status !== "FINISHED" && b.status === "FINISHED") return 1;
+        return String(b.created_at || "").localeCompare(String(a.created_at || ""));
+      });
+      tasksEl.innerHTML = items.length ? items.map(renderTask).join("") : "<div class='empty'>还没有任务</div>";
+    }
+
+    document.getElementById("task-form").addEventListener("submit", async (event) => {
+      event.preventDefault();
+      submit.disabled = true;
+      message.textContent = "任务创建中...";
+      try {
+        const url = document.getElementById("url").value.trim();
+        const task = await requestJson("/tasks", {
+          method: "POST",
+          body: JSON.stringify({ url }),
+        });
+        message.textContent = `已创建任务 ${task.task_id}，状态 ${task.status}`;
+        event.target.reset();
+        await loadTasks();
+      } catch (error) {
+        message.textContent = `失败：${error.message}`;
+      } finally {
+        submit.disabled = false;
+      }
+    });
+
+    document.getElementById("refresh").addEventListener("click", () => loadTasks().catch(error => {
+      message.textContent = `刷新失败：${error.message}`;
+    }));
+
+    loadTasks().catch(error => {
+      message.textContent = `加载任务失败：${error.message}`;
+    });
+    setInterval(() => loadTasks().catch(() => {}), 5000);
+  </script>
+</body>
+</html>"""
+
+
 def process_api_task(task_id: str) -> None:
     with API_TASK_LOCK:
         task = get_api_task(task_id)
@@ -1835,7 +2076,7 @@ class AudioFlowAPIHandler(BaseHTTPRequestHandler):
         parsed = urlsplit(self.path)
         path = parsed.path.rstrip("/") or "/"
         if path == "/":
-            body = b"""<html><head><meta charset='utf-8'><title>AudioFlow API</title></head><body><h1>AudioFlow API</h1><ul><li>GET /health</li><li>POST /tasks</li><li>GET /tasks</li><li>GET /tasks/{id}</li><li>GET /files/{id}?kind=markdown|transcript|summary|review</li></ul></body></html>"""
+            body = api_index_html().encode("utf-8")
             self._send_text(200, body, "text/html; charset=utf-8")
             return
         if path == "/health":

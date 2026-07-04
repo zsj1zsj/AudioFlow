@@ -411,8 +411,9 @@ class AudioFlowTest(unittest.TestCase):
                 try:
                     port = server.server_address[1]
                     body = urlopen(f"http://127.0.0.1:{port}/", timeout=5).read().decode("utf-8")
-                    self.assertIn("AudioFlow API", body)
-                    self.assertIn("GET /tasks", body)
+                    self.assertIn("AudioFlow", body)
+                    self.assertIn("开始处理", body)
+                    self.assertIn("任务列表", body)
                 finally:
                     server.shutdown()
                     server.server_close()
