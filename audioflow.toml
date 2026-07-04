@@ -1,0 +1,24 @@
+[download.youtube]
+executable = "yt-dlp"
+
+[download.bilibili]
+executable = "yt-dlp-nightly"
+proxy = ""
+cookies_from_browser = "chrome"
+
+[transcriber]
+provider = "faster-whisper"
+model = "turbo"
+device = "cpu"
+compute_type = "int8"
+language = ""
+
+[llm]
+provider = "openai-compatible"
+api_key = ""
+base_url = ""
+model = ""
+chunk_size = 12000
+
+[storage]
+sqlite = "data/audioflow.db"
