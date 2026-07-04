@@ -39,6 +39,84 @@ python -m pip install -e .
 
 安装后使用 `audioflow` 命令。也可以执行 `python audioflow.py`。
 
+## REST API
+
+启动 HTTP 服务：
+
+```bash
+audioflow serve --host 0.0.0.0 --port 8080
+```
+
+如果你要在手机上通过 Tailscale 访问，`--host 0.0.0.0` 是必须的。
+
+打开首页可以先看接口列表：
+
+```bash
+curl http://127.0.0.1:8080/
+```
+
+健康检查：
+
+```bash
+curl http://127.0.0.1:8080/health
+```
+
+### 真实例子
+
+以下用这条 YouTube 链接作为例子：
+
+```text
+https://youtu.be/ucVQconuTJI?si=Vkpu-enF9iFIAyjY
+```
+
+1. 创建任务
+
+```bash
+curl -X POST http://127.0.0.1:8080/tasks \
+  -H "Content-Type: application/json" \
+  -d '{"url":"https://youtu.be/ucVQconuTJI?si=Vkpu-enF9iFIAyjY"}'
+```
+
+返回会包含 `task_id`，例如：
+
+```json
+{
+  "task_id": "0a7d1cdf0711",
+  "status": "QUEUED"
+}
+```
+
+2. 轮询任务状态
+
+```bash
+curl http://127.0.0.1:8080/tasks/0a7d1cdf0711
+```
+
+状态会从 `QUEUED` 走到 `DOWNLOADING`、`TRANSCRIBING`、`SUMMARIZING`，最后到 `FINISHED`。
+
+3. 下载生成文件
+
+```bash
+curl -L -o note.md 'http://127.0.0.1:8080/files/0a7d1cdf0711?kind=markdown'
+curl -L -o transcript.txt 'http://127.0.0.1:8080/files/0a7d1cdf0711?kind=transcript'
+curl -L -o summary.md 'http://127.0.0.1:8080/files/0a7d1cdf0711?kind=summary'
+curl -L -o review.md 'http://127.0.0.1:8080/files/0a7d1cdf0711?kind=review'
+```
+
+4. 用手机访问
+
+```text
+http://<你的Tailscale-IP>:8080/
+http://<你的Tailscale-IP>:8080/health
+http://<你的Tailscale-IP>:8080/tasks
+```
+
+如果你的 Mac Tailscale IP 是 `100.70.209.107`，手机就访问：
+
+```text
+http://100.70.209.107:8080/
+```
+
 ## 完整流水线
 
 单个 URL：

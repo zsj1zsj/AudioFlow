@@ -1,9 +1,12 @@
 import unittest
 import shutil
 import subprocess
+import threading
+import time
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
+from urllib.request import Request, urlopen
 
 import audioflow
 from audioflow import (
@@ -328,6 +331,91 @@ class AudioFlowTest(unittest.TestCase):
         </entry></feed>"""
         title, entries = parse_feed(atom)
         self.assertEqual((title, entries[0]["guid"]), ("Atom 播客", "two"))
+
+    def test_rest_api_creates_and_serves_task_files(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            task_ready = threading.Event()
+
+            def fake_process(task_id: str) -> None:
+                task_ready.wait(timeout=2)
+                transcript = root / "transcripts" / f"{task_id}.txt"
+                note = root / "notes" / f"{task_id}.md"
+                transcript.parent.mkdir(parents=True, exist_ok=True)
+                note.parent.mkdir(parents=True, exist_ok=True)
+                transcript.write_text("[00:00:00] 测试", encoding="utf-8")
+                note.write_text("# 测试笔记\n", encoding="utf-8")
+                audioflow.update_api_task(
+                    task_id,
+                    status="FINISHED",
+                    transcript_path=str(transcript),
+                    note_path=str(note),
+                    error=None,
+                )
+
+            with patch.object(audioflow, "DATABASE_PATH", root / "audioflow.db"), patch.object(
+                audioflow, "TRANSCRIPTS_DIR", root / "transcripts"
+            ), patch.object(audioflow, "NOTES_DIR", root / "notes"), patch.object(
+                audioflow, "SUMMARIES_DIR", root / "summaries"
+            ), patch.object(audioflow, "METADATA_DIR", root / "metadata"), patch.object(
+                audioflow, "process_api_task", side_effect=fake_process
+            ):
+                server = audioflow.ThreadingHTTPServer(("127.0.0.1", 0), audioflow.AudioFlowAPIHandler)
+                server.daemon_threads = True
+                thread = threading.Thread(target=server.serve_forever, daemon=True)
+                thread.start()
+                try:
+                    port = server.server_address[1]
+                    request = Request(
+                        f"http://127.0.0.1:{port}/tasks",
+                        data=audioflow.json.dumps({"url": "https://youtu.be/abc"}).encode("utf-8"),
+                        headers={"Content-Type": "application/json"},
+                    )
+                    response = urlopen(request, timeout=5)
+                    payload = audioflow.json.loads(response.read().decode("utf-8"))
+                    self.assertEqual(payload["status"], "QUEUED")
+                    task_id = payload["task_id"]
+                    task_ready.set()
+
+                    for _ in range(50):
+                        task = audioflow.json.loads(
+                            urlopen(f"http://127.0.0.1:{port}/tasks/{task_id}", timeout=5)
+                            .read()
+                            .decode("utf-8")
+                        )
+                        if task["status"] == "FINISHED":
+                            break
+                        time.sleep(0.05)
+                    self.assertEqual(task["status"], "FINISHED")
+
+                    markdown = urlopen(
+                        f"http://127.0.0.1:{port}/files/{task_id}?kind=markdown", timeout=5
+                    ).read().decode("utf-8")
+                    transcript = urlopen(
+                        f"http://127.0.0.1:{port}/files/{task_id}?kind=transcript", timeout=5
+                    ).read().decode("utf-8")
+                    self.assertIn("# 测试笔记", markdown)
+                    self.assertIn("测试", transcript)
+                finally:
+                    server.shutdown()
+                    server.server_close()
+
+    def test_rest_api_root_page(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            with patch.object(audioflow, "DATABASE_PATH", root / "audioflow.db"):
+                server = audioflow.ThreadingHTTPServer(("127.0.0.1", 0), audioflow.AudioFlowAPIHandler)
+                server.daemon_threads = True
+                thread = threading.Thread(target=server.serve_forever, daemon=True)
+                thread.start()
+                try:
+                    port = server.server_address[1]
+                    body = urlopen(f"http://127.0.0.1:{port}/", timeout=5).read().decode("utf-8")
+                    self.assertIn("AudioFlow API", body)
+                    self.assertIn("GET /tasks", body)
+                finally:
+                    server.shutdown()
+                    server.server_close()
 
     @unittest.skipUnless(shutil.which("ffmpeg"), "ffmpeg is required")
     def test_offline_end_to_end_pipeline(self):

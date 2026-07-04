@@ -7,15 +7,18 @@ import re
 import shutil
 import sqlite3
 import subprocess
+import threading
+import uuid
 import tomllib
 import xml.etree.ElementTree as ET
 from abc import ABC, abstractmethod
 from dataclasses import asdict, dataclass
 from datetime import datetime
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Protocol
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, quote, urlparse, urlsplit
 
 import requests
 import typer
@@ -897,6 +900,28 @@ def open_database(path: Path | None = None) -> sqlite3.Connection:
         )
         """
     )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS api_tasks (
+            id TEXT PRIMARY KEY,
+            url TEXT NOT NULL,
+            status TEXT NOT NULL,
+            title TEXT,
+            source TEXT,
+            language TEXT,
+            hotwords TEXT,
+            error TEXT,
+            raw_audio_path TEXT,
+            normalized_audio_path TEXT,
+            transcript_path TEXT,
+            summary_path TEXT,
+            review_path TEXT,
+            note_path TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
     stage_columns = {row[1] for row in connection.execute("PRAGMA table_info(stage_runs)")}
     if "input_ref" not in stage_columns:
         connection.execute("ALTER TABLE stage_runs ADD COLUMN input_ref TEXT")
@@ -1002,6 +1027,191 @@ def upsert_episode(connection: sqlite3.Connection, record: dict) -> None:
         tuple(record[column] for column in columns),
     )
     connection.commit()
+
+
+API_TASK_LOCK = threading.Lock()
+_API_TRANSCRIBER: Transcriber | None = None
+
+
+def api_transcriber() -> Transcriber:
+    global _API_TRANSCRIBER
+    if _API_TRANSCRIBER is not None:
+        return _API_TRANSCRIBER
+    if TRANSCRIBER_PROVIDER != "faster-whisper":
+        raise RuntimeError(f"尚未实现转录 Provider：{TRANSCRIBER_PROVIDER}")
+    try:
+        from faster_whisper import WhisperModel
+    except ImportError as error:
+        raise RuntimeError("未安装 faster-whisper，请运行 python3 -m pip install faster-whisper") from error
+
+    _API_TRANSCRIBER = FasterWhisperTranscriber(
+        WhisperModel(
+            TRANSCRIBER_MODEL,
+            device=TRANSCRIBER_DEVICE,
+            compute_type=TRANSCRIBER_COMPUTE_TYPE,
+        ),
+        TRANSCRIBER_MODEL,
+    )
+    return _API_TRANSCRIBER
+
+
+def get_api_task(task_id: str) -> dict | None:
+    with open_database() as connection:
+        row = connection.execute("SELECT * FROM api_tasks WHERE id=?", (task_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def update_api_task(task_id: str, **fields: object) -> None:
+    allowed = {
+        "status",
+        "title",
+        "source",
+        "language",
+        "hotwords",
+        "error",
+        "raw_audio_path",
+        "normalized_audio_path",
+        "transcript_path",
+        "summary_path",
+        "review_path",
+        "note_path",
+    }
+    updates = {key: fields[key] for key in fields if key in allowed}
+    if not updates:
+        return
+    columns = ", ".join(f"{key}=?" for key in updates)
+    with open_database() as connection:
+        connection.execute(
+            f"UPDATE api_tasks SET {columns}, updated_at=CURRENT_TIMESTAMP WHERE id=?",
+            (*updates.values(), task_id),
+        )
+        connection.commit()
+
+
+def create_api_task(url: str, *, language: str | None = None, hotwords: str | None = None) -> dict:
+    task_id = uuid.uuid4().hex[:12]
+    with open_database() as connection:
+        connection.execute(
+            "INSERT INTO api_tasks (id, url, status, language, hotwords) VALUES (?, ?, 'QUEUED', ?, ?)",
+            (task_id, url, language, hotwords),
+        )
+        connection.commit()
+    return get_api_task(task_id) or {"id": task_id, "url": url, "status": "QUEUED"}
+
+
+def start_api_task(task_id: str) -> None:
+    threading.Thread(target=process_api_task, args=(task_id,), daemon=True).start()
+
+
+def list_api_tasks() -> list[dict]:
+    with open_database() as connection:
+        rows = connection.execute("SELECT * FROM api_tasks ORDER BY created_at DESC, id DESC").fetchall()
+    return [dict(row) for row in rows]
+
+
+def delete_api_task(task_id: str) -> bool:
+    with open_database() as connection:
+        row = connection.execute("SELECT status FROM api_tasks WHERE id=?", (task_id,)).fetchone()
+        if row is None:
+            return False
+        if row["status"] not in {"QUEUED", "DOWNLOADING", "TRANSCRIBING", "SUMMARIZING"}:
+            connection.execute("DELETE FROM api_tasks WHERE id=?", (task_id,))
+            connection.commit()
+            return True
+    raise RuntimeError("任务正在运行，暂不支持删除")
+
+
+def api_task_payload(row: dict) -> dict:
+    task_id = row["id"]
+    files = {}
+    for kind, key in {
+        "markdown": "note_path",
+        "transcript": "transcript_path",
+        "summary": "summary_path",
+        "review": "review_path",
+    }.items():
+        if row.get(key):
+            files[kind] = f"/files/{task_id}?kind={kind}"
+    return {
+        "task_id": task_id,
+        "url": row["url"],
+        "status": row["status"],
+        "title": row.get("title"),
+        "source": row.get("source"),
+        "language": row.get("language"),
+        "hotwords": row.get("hotwords"),
+        "error": row.get("error"),
+        "created_at": row.get("created_at"),
+        "updated_at": row.get("updated_at"),
+        "files": files,
+    }
+
+
+def api_task_file_path(row: dict, kind: str) -> Path:
+    mapping = {
+        "markdown": "note_path",
+        "transcript": "transcript_path",
+        "summary": "summary_path",
+        "review": "review_path",
+        "raw": "raw_audio_path",
+        "normalized": "normalized_audio_path",
+    }
+    column = mapping.get(kind)
+    if column is None:
+        raise ValueError(f"不支持的文件类型：{kind}")
+    value = row.get(column)
+    if not value:
+        raise FileNotFoundError(f"任务没有可下载的 {kind} 文件")
+    path = Path(str(value))
+    if not path.exists():
+        raise FileNotFoundError(f"文件不存在：{path}")
+    return path
+
+
+def process_api_task(task_id: str) -> None:
+    with API_TASK_LOCK:
+        task = get_api_task(task_id)
+        if task is None:
+            return
+        hotwords = read_hotwords(task.get("hotwords"))
+        try:
+            update_api_task(task_id, status="DOWNLOADING", error=None)
+            dispatcher = DownloaderDispatcher()
+            download = cached_download_result(task["url"])
+            if download is None:
+                download = dispatcher.download(task["url"])
+            update_api_task(
+                task_id,
+                title=download.title,
+                source=download.source,
+                raw_audio_path=str(download.audio_path),
+                status="TRANSCRIBING",
+            )
+            normalized = normalize_audio(download.audio_path)
+            update_api_task(task_id, normalized_audio_path=str(normalized), status="TRANSCRIBING")
+            transcript = transcribe_audio(
+                normalized,
+                api_transcriber(),
+                language=task.get("language"),
+                hotwords=hotwords,
+            )
+            update_api_task(task_id, transcript_path=str(transcript), status="SUMMARIZING")
+            review, _ = validate_transcript(METADATA_DIR / f"{normalized.stem}.segments.json")
+            summary = summarize_one(transcript)
+            note = build_markdown_note(transcript, overwrite=True)
+            with open_database() as connection:
+                upsert_episode(connection, episode_record(transcript))
+            update_api_task(
+                task_id,
+                status="FINISHED",
+                transcript_path=str(transcript),
+                summary_path=str(summary) if summary else None,
+                review_path=str(review),
+                note_path=str(note),
+                error=None,
+            )
+        except Exception as error:
+            update_api_task(task_id, status="FAILED", error=str(error))
 
 
 def xml_text(element: ET.Element, name: str) -> str | None:
@@ -1583,6 +1793,151 @@ def run_command(
             console.print(f"[red]处理失败：[/red]{url}\n{error}")
     if failures:
         raise typer.Exit(code=1)
+
+
+class AudioFlowAPIHandler(BaseHTTPRequestHandler):
+    server_version = "AudioFlowAPI/1.0"
+
+    def log_message(self, format: str, *args: object) -> None:  # noqa: A003
+        console.print(f"[dim]{self.address_string()} - {format % args}[/dim]")
+
+    def _send_json(self, status: int, payload: dict) -> None:
+        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _send_text(self, status: int, payload: bytes, content_type: str, filename: str | None = None) -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(payload)))
+        if filename:
+            if filename.isascii():
+                self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+            else:
+                self.send_header("Content-Disposition", f"attachment; filename*=UTF-8''{quote(filename)}")
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def _read_json(self) -> dict:
+        length = int(self.headers.get("Content-Length", "0"))
+        raw = self.rfile.read(length) if length else b"{}"
+        if not raw:
+            return {}
+        payload = json.loads(raw.decode("utf-8"))
+        if not isinstance(payload, dict):
+            raise ValueError("JSON body must be an object")
+        return payload
+
+    def do_GET(self) -> None:  # noqa: N802
+        parsed = urlsplit(self.path)
+        path = parsed.path.rstrip("/") or "/"
+        if path == "/":
+            body = b"""<html><head><meta charset='utf-8'><title>AudioFlow API</title></head><body><h1>AudioFlow API</h1><ul><li>GET /health</li><li>POST /tasks</li><li>GET /tasks</li><li>GET /tasks/{id}</li><li>GET /files/{id}?kind=markdown|transcript|summary|review</li></ul></body></html>"""
+            self._send_text(200, body, "text/html; charset=utf-8")
+            return
+        if path == "/health":
+            self._send_json(200, {"status": "ok"})
+            return
+        if path == "/tasks":
+            self._send_json(200, {"items": [api_task_payload(row) for row in list_api_tasks()]})
+            return
+        if path.startswith("/tasks/"):
+            task_id = path.removeprefix("/tasks/")
+            task = get_api_task(task_id)
+            if task is None:
+                self._send_json(404, {"detail": "task not found"})
+                return
+            self._send_json(200, api_task_payload(task))
+            return
+        if path.startswith("/files/"):
+            task_id = path.removeprefix("/files/")
+            task = get_api_task(task_id)
+            if task is None:
+                self._send_json(404, {"detail": "task not found"})
+                return
+            kind = parse_qs(parsed.query).get("kind", ["markdown"])[0]
+            try:
+                file_path = api_task_file_path(task, kind)
+            except (FileNotFoundError, ValueError) as error:
+                self._send_json(404, {"detail": str(error)})
+                return
+            data = file_path.read_bytes()
+            if file_path.suffix == ".md":
+                content_type = "text/markdown; charset=utf-8"
+            elif file_path.suffix in {".txt", ".review.md"}:
+                content_type = "text/plain; charset=utf-8"
+            elif file_path.suffix == ".json":
+                content_type = "application/json; charset=utf-8"
+            else:
+                content_type = "application/octet-stream"
+            self._send_text(200, data, content_type, file_path.name)
+            return
+        self._send_json(404, {"detail": "not found"})
+
+    def do_POST(self) -> None:  # noqa: N802
+        parsed = urlsplit(self.path)
+        path = parsed.path.rstrip("/") or "/"
+        if path != "/tasks":
+            self._send_json(404, {"detail": "not found"})
+            return
+        try:
+            payload = self._read_json()
+        except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as error:
+            self._send_json(400, {"detail": str(error)})
+            return
+        url = str(payload.get("url", "")).strip()
+        if not url:
+            self._send_json(400, {"detail": "url is required"})
+            return
+        if urlparse(url).scheme not in {"http", "https"}:
+            self._send_json(400, {"detail": "url must be http or https"})
+            return
+        language = payload.get("language")
+        language = str(language).strip() if language is not None else TRANSCRIBER_LANGUAGE
+        language = language or None
+        hotwords = payload.get("hotwords")
+        hotwords = str(hotwords).strip() if hotwords is not None else None
+        hotwords = hotwords or None
+        task = create_api_task(url, language=language, hotwords=hotwords)
+        self._send_json(201, api_task_payload(task))
+        start_api_task(task["id"])
+
+    def do_DELETE(self) -> None:  # noqa: N802
+        parsed = urlsplit(self.path)
+        path = parsed.path.rstrip("/") or "/"
+        if not path.startswith("/tasks/"):
+            self._send_json(404, {"detail": "not found"})
+            return
+        task_id = path.removeprefix("/tasks/")
+        try:
+            deleted = delete_api_task(task_id)
+        except RuntimeError as error:
+            self._send_json(409, {"detail": str(error)})
+            return
+        if not deleted:
+            self._send_json(404, {"detail": "task not found"})
+            return
+        self._send_json(200, {"deleted": True, "task_id": task_id})
+
+
+@app.command("serve")
+def serve_command(
+    host: str = typer.Option("0.0.0.0", "--host", help="监听地址"),
+    port: int = typer.Option(8080, "--port", help="监听端口"),
+) -> None:
+    """Serve the REST API for mobile and automation clients."""
+    server = ThreadingHTTPServer((host, port), AudioFlowAPIHandler)
+    server.daemon_threads = True
+    console.print(f"[green]AudioFlow API listening on[/green] http://{host}:{port}")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
 
 
 if __name__ == "__main__":
