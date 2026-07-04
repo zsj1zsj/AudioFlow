@@ -8,6 +8,7 @@ import shutil
 import sqlite3
 import subprocess
 import threading
+import time
 import uuid
 import tomllib
 import xml.etree.ElementTree as ET
@@ -207,13 +208,19 @@ def register_downloader(cls: type[BaseDownloader]) -> type[BaseDownloader]:
 
 
 class YtDlpDownloader(BaseDownloader):
-    executable = str(config_value("download.youtube", "executable", "yt-dlp"))
+    executable = str(config_value("download.youtube", "executable", "yt-dlp-nightly"))
     source = "Youtube"
     extra_args: tuple[str, ...] = ()
+    retry_attempts = 1
+    retry_delay_seconds = 2.0
+    retry_backoff = 2.0
 
     @staticmethod
     def supports(url: str) -> bool:
         return hostname(url) in {"youtube.com", "youtu.be", "m.youtube.com"}
+
+    def _should_retry(self, error_text: str) -> bool:
+        return False
 
     def download(self, url: str) -> DownloadResult:
         executable = shutil.which(self.executable)
@@ -238,9 +245,18 @@ class YtDlpDownloader(BaseDownloader):
             url,
         ]
         console.print(f"[cyan]使用 {self.executable} 下载：[/cyan]{url}")
-        result = subprocess.run(command, text=True, capture_output=True)
-        if result.returncode:
-            raise RuntimeError(result.stderr.strip() or f"{self.executable} 下载失败")
+        last_error = ""
+        delay = self.retry_delay_seconds
+        for attempt in range(1, self.retry_attempts + 1):
+            result = subprocess.run(command, text=True, capture_output=True)
+            if result.returncode == 0:
+                break
+            last_error = result.stderr.strip() or f"{self.executable} 下载失败"
+            if attempt >= self.retry_attempts or not self._should_retry(last_error):
+                raise RuntimeError(last_error)
+            console.print(f"[yellow]下载失败，{delay:.0f}s 后重试（{attempt}/{self.retry_attempts}）[/yellow]")
+            time.sleep(delay)
+            delay *= self.retry_backoff
         output_lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
         if not output_lines:
             raise RuntimeError("yt-dlp 下载完成，但没有返回输出文件")
@@ -269,16 +285,32 @@ class YoutubeDownloader(YtDlpDownloader):
 class BilibiliDownloader(YtDlpDownloader):
     executable = str(config_value("download.bilibili", "executable", "yt-dlp-nightly"))
     source = "Bilibili"
+    retry_attempts = 3
+    retry_delay_seconds = 3.0
+    retry_backoff = 1.8
     extra_args = (
         "--proxy",
         str(config_value("download.bilibili", "proxy", "")),
         "--cookies-from-browser",
         str(config_value("download.bilibili", "cookies_from_browser", "chrome")),
+        "--legacy-server-connect",
+        "--no-check-certificates",
     )
 
     @staticmethod
     def supports(url: str) -> bool:
         return hostname(url) in {"bilibili.com", "m.bilibili.com", "b23.tv"}
+
+    def _should_retry(self, error_text: str) -> bool:
+        transient_markers = (
+            "HTTP Error 404",
+            "HTTP Error 412",
+            "HTTP Error 503",
+            "SSLV3_ALERT_HANDSHAKE_FAILURE",
+            "certificate verify failed",
+            "unable to download video data",
+        )
+        return any(marker in error_text for marker in transient_markers)
 
 
 @register_downloader
@@ -390,12 +422,18 @@ def download_stage_key(url: str) -> str:
 
 def download_fingerprint(url: str) -> str:
     return stage_fingerprint(
-        "download:v1",
+        "download:v3",
         [],
         {
             "url": url,
-            "youtube": config_value("download.youtube", "executable", "yt-dlp"),
+            "youtube": config_value("download.youtube", "executable", "yt-dlp-nightly"),
             "bilibili": config_value("download.bilibili", "executable", "yt-dlp-nightly"),
+            "bilibili_args": [
+                config_value("download.bilibili", "proxy", ""),
+                config_value("download.bilibili", "cookies_from_browser", "chrome"),
+                "--legacy-server-connect",
+                "--no-check-certificates",
+            ],
         },
     )
 
@@ -1124,12 +1162,14 @@ def delete_api_task(task_id: str) -> bool:
 def api_task_payload(row: dict) -> dict:
     task_id = row["id"]
     files = {}
+    views = {}
     for kind, key in {
         "markdown": "note_path",
         "transcript": "transcript_path",
         "summary": "summary_path",
         "review": "review_path",
     }.items():
+        views[kind] = f"/view/{task_id}?kind={kind}"
         if row.get(key):
             files[kind] = f"/files/{task_id}?kind={kind}"
     return {
@@ -1143,6 +1183,7 @@ def api_task_payload(row: dict) -> dict:
         "error": row.get("error"),
         "created_at": row.get("created_at"),
         "updated_at": row.get("updated_at"),
+        "views": views,
         "files": files,
     }
 
@@ -1254,12 +1295,20 @@ def api_index_html() -> str:
       background: var(--panel-2);
       border: 1px solid var(--border);
     }
+    .task summary {
+      cursor: pointer;
+      list-style: none;
+    }
+    .task summary::-webkit-details-marker {
+      display: none;
+    }
     .task-head {
       display: flex;
       justify-content: space-between;
       gap: 12px;
       align-items: flex-start;
       flex-wrap: wrap;
+      margin-bottom: 10px;
     }
     .title { font-weight: 700; word-break: break-word; }
     .small { font-size: 13px; color: var(--muted); }
@@ -1272,6 +1321,7 @@ def api_index_html() -> str:
       border: 1px solid rgba(148, 163, 184, 0.2);
       background: rgba(15, 23, 42, 0.55);
     }
+    .links a.primary { background: rgba(56, 189, 248, 0.2); }
     .empty {
       padding: 24px;
       text-align: center;
@@ -1289,11 +1339,11 @@ def api_index_html() -> str:
   <div class="wrap">
     <section class="hero">
       <h1>AudioFlow</h1>
-      <p>输入一个 URL，点击按钮，后台会自动下载、转录、总结并生成 Markdown。完成后直接在下面打开笔记。</p>
+      <p>输入一个 URL，点击按钮，后台会自动下载、转录、总结并生成 Markdown。完成后点进 Summary 或 Markdown 详情页查看正文。</p>
       <div class="meta">
         <span class="pill">POST /tasks</span>
         <span class="pill">GET /tasks/{id}</span>
-        <span class="pill">GET /files/{id}?kind=markdown</span>
+        <span class="pill">GET /view/{id}?kind=summary</span>
       </div>
     </section>
 
@@ -1342,37 +1392,36 @@ def api_index_html() -> str:
     }
 
     function link(kind, task) {
-      const href = task.files && task.files[kind];
+      const href = task.views && task.views[kind];
       if (!href) return "";
       const label = kind === "markdown" ? "Markdown" : kind === "transcript" ? "Transcript" : kind === "summary" ? "Summary" : "Review";
-      return `<a href="${href}" target="_blank" rel="noreferrer">${label}</a>`;
+      return `<a class="primary" href="${href}">${label}</a>`;
     }
 
     function renderTask(task) {
-      const files = ["markdown", "transcript", "summary", "review"].map(kind => link(kind, task)).filter(Boolean).join("");
+      const files = ["summary", "markdown", "transcript", "review"].map(kind => link(kind, task)).filter(Boolean).join("");
       return `
-        <div class="task">
-          <div class="task-head">
-            <div>
-              <div class="title">${task.title || task.url}</div>
-              <div class="small">#${task.task_id} · ${task.status} · ${task.created_at || ""}</div>
+        <details class="task">
+          <summary>
+            <div class="task-head">
+              <div>
+                <div class="title">${task.title || task.url}</div>
+                <div class="small">${task.status} · ${task.created_at || ""}</div>
+              </div>
             </div>
-            <div class="small">${task.source || ""}</div>
-          </div>
-          <div class="small" style="margin-top:8px; word-break: break-word;">${task.url}</div>
-          <div class="links">${files || "<span class='small'>等待完成后显示文件链接</span>"}</div>
-        </div>
+          </summary>
+          <div class="small" style="word-break: break-word; margin-top: 8px;">${task.url}</div>
+          <div class="small" style="margin-top: 6px;">${task.source || ""}</div>
+          <div class="links">${files || "<span class='small'>等待完成后显示页面链接</span>"}</div>
+        </details>
       `;
     }
 
     async function loadTasks() {
       const data = await requestJson("/tasks");
       const items = (data.items || []).slice();
-      items.sort((a, b) => {
-        if (a.status === "FINISHED" && b.status !== "FINISHED") return -1;
-        if (a.status !== "FINISHED" && b.status === "FINISHED") return 1;
-        return String(b.created_at || "").localeCompare(String(a.created_at || ""));
-      });
+      items.sort((a, b) => String(b.created_at || "").localeCompare(String(a.created_at || "")));
+      items.splice(10);
       tasksEl.innerHTML = items.length ? items.map(renderTask).join("") : "<div class='empty'>还没有任务</div>";
     }
 
@@ -1404,6 +1453,146 @@ def api_index_html() -> str:
       message.textContent = `加载任务失败：${error.message}`;
     });
     setInterval(() => loadTasks().catch(() => {}), 5000);
+  </script>
+</body>
+</html>"""
+
+
+def api_detail_html(task_id: str, kind: str) -> str:
+    return f"""<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AudioFlow {kind}</title>
+  <style>
+    :root {{
+      color-scheme: light;
+      --bg: #0f172a;
+      --panel: #111827;
+      --text: #e5e7eb;
+      --muted: #9ca3af;
+      --accent: #38bdf8;
+      --border: rgba(148, 163, 184, 0.22);
+    }}
+    * {{ box-sizing: border-box; }}
+    body {{
+      margin: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: radial-gradient(circle at top, #1e293b 0, #0f172a 45%, #020617 100%);
+      color: var(--text);
+    }}
+    .wrap {{ max-width: 900px; margin: 0 auto; padding: 20px 16px 40px; }}
+    .card {{
+      background: rgba(17, 24, 39, 0.88);
+      border: 1px solid var(--border);
+      border-radius: 18px;
+      padding: 16px;
+      backdrop-filter: blur(12px);
+    }}
+    a {{ color: #dbeafe; text-decoration: none; }}
+    .top {{
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      align-items: flex-start;
+      flex-wrap: wrap;
+      margin-bottom: 12px;
+    }}
+    .title {{ font-size: 22px; font-weight: 700; }}
+    .small {{ color: var(--muted); font-size: 13px; line-height: 1.5; }}
+    .links {{ display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }}
+    .links a {{
+      padding: 8px 12px;
+      border-radius: 999px;
+      border: 1px solid var(--border);
+      background: rgba(15, 23, 42, 0.65);
+    }}
+    .links a.dim {{
+      opacity: 0.55;
+      pointer-events: none;
+    }}
+    pre {{
+      margin: 0;
+      white-space: pre-wrap;
+      word-break: break-word;
+      font-size: 14px;
+      line-height: 1.7;
+      color: #e2e8f0;
+    }}
+    .content {{
+      margin-top: 14px;
+      padding: 14px;
+      border-radius: 14px;
+      border: 1px solid rgba(148, 163, 184, 0.16);
+      background: rgba(2, 6, 23, 0.72);
+      max-height: 68vh;
+      overflow: auto;
+    }}
+    .pill {{
+      display: inline-block;
+      padding: 4px 10px;
+      border-radius: 999px;
+      background: rgba(56, 189, 248, 0.16);
+      color: #dbeafe;
+      border: 1px solid var(--border);
+      font-size: 12px;
+    }}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card">
+      <div class="top">
+        <div>
+          <div class="title" id="page-title">加载中...</div>
+          <div class="small" id="page-meta">task_id: {task_id}</div>
+        </div>
+        <div class="pill" id="page-kind">{kind}</div>
+      </div>
+      <div class="links">
+        <a href="/">返回首页</a>
+        <a id="download-link" href="#" target="_blank" rel="noreferrer">打开原文件</a>
+      </div>
+      <div class="content">
+        <pre id="content">加载中...</pre>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const taskId = {json.dumps(task_id)};
+    const kind = {json.dumps(kind)};
+    const titleMap = {{ markdown: "Markdown", transcript: "Transcript", summary: "Summary", review: "Review" }};
+    document.getElementById("page-kind").textContent = titleMap[kind] || kind;
+
+    async function load() {{
+      const taskResponse = await fetch(`/tasks/${{taskId}}`);
+      const task = await taskResponse.json();
+      if (!taskResponse.ok) {{
+        throw new Error(task.detail || "无法读取任务");
+      }}
+      document.getElementById("page-title").textContent = `${{task.title || task.url}} · ${{titleMap[kind] || kind}}`;
+      document.getElementById("page-meta").textContent = `#${{task.task_id}} · ${{task.status}} · ${{task.source || ""}}`;
+      const fileUrl = task.files && task.files[kind];
+      if (!fileUrl) {{
+        document.getElementById("download-link").removeAttribute("href");
+        document.getElementById("download-link").classList.add("dim");
+        document.getElementById("content").textContent = `该任务还没有生成 ${{titleMap[kind] || kind}}。`;
+        return;
+      }}
+      document.getElementById("download-link").href = fileUrl;
+      const fileResponse = await fetch(fileUrl);
+      if (!fileResponse.ok) {{
+        throw new Error(fileResponse.statusText);
+      }}
+      document.getElementById("content").textContent = await fileResponse.text();
+    }}
+
+    load().catch(error => {{
+      document.getElementById("content").textContent = `加载失败：${{error.message}}`;
+      document.getElementById("page-title").textContent = "AudioFlow";
+    }});
   </script>
 </body>
 </html>"""
@@ -2084,6 +2273,11 @@ class AudioFlowAPIHandler(BaseHTTPRequestHandler):
             return
         if path == "/tasks":
             self._send_json(200, {"items": [api_task_payload(row) for row in list_api_tasks()]})
+            return
+        if path.startswith("/view/"):
+            task_id = path.removeprefix("/view/")
+            kind = parse_qs(parsed.query).get("kind", ["summary"])[0]
+            self._send_text(200, api_detail_html(task_id, kind).encode("utf-8"), "text/html; charset=utf-8")
             return
         if path.startswith("/tasks/"):
             task_id = path.removeprefix("/tasks/")

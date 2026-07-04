@@ -17,7 +17,7 @@ URL / RSS
 
 | 来源 | 支持方式 |
 |---|---|
-| YouTube | yt-dlp |
+| YouTube | yt-dlp nightly |
 | Bilibili | yt-dlp nightly + Chrome cookies |
 | 小宇宙 | 网页公开音频地址 |
 | RSS / Atom | enclosure 增量下载 |
@@ -29,6 +29,12 @@ URL / RSS
 - Python 3.11+
 - ffmpeg / ffprobe
 - macOS 上的 Bilibili 下载默认使用 `~/.local/bin/yt-dlp-nightly`
+
+## 已知限制
+
+- Bilibili 目前默认走 `yt-dlp-nightly + Chrome cookies`，并对常见的临时失败做自动重试。
+- 如果仍然遇到 `HTTP 404 / 412 / 503`，通常是 B 站源站拦截或证书链问题，不是 REST API 本身坏了。
+- 现在的默认策略已经能覆盖一部分偶发失败，但还不是百分百稳定；后续更稳的方案是改成显式 `cookies.txt`。
 
 ```bash
 brew install ffmpeg

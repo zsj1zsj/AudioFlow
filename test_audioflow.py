@@ -62,6 +62,39 @@ class AudioFlowTest(unittest.TestCase):
             payload = audioflow.json.loads(metadata.read_text(encoding="utf-8"))
             self.assertEqual((payload["title"], payload["audio_path"]), ("标题", str(audio)))
 
+    def test_bilibili_downloader_retries_transient_errors(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            raw_dir = root / "raw_audio"
+            raw_dir.mkdir()
+            output = raw_dir / "【大厂文章速度】-阿里-一种基于分布式缓存的强一致性热点库存扣减方案 [BV1jP6LBTEbY].mp3"
+            attempts = []
+
+            def fake_run(command, **_kwargs):
+                attempts.append(command)
+                if len(attempts) == 1:
+                    return type(
+                        "Result",
+                        (),
+                        {
+                            "returncode": 1,
+                            "stderr": "ERROR: unable to download video data: HTTP Error 404: Site Not Found",
+                            "stdout": "",
+                        },
+                    )()
+                output.touch()
+                return type("Result", (), {"returncode": 0, "stderr": "", "stdout": f"{output}\n"})()
+
+            with patch.object(audioflow, "RAW_AUDIO_DIR", raw_dir), patch(
+                "audioflow.shutil.which", return_value="/usr/bin/yt-dlp-nightly"
+            ), patch("audioflow.subprocess.run", side_effect=fake_run), patch.object(
+                audioflow, "embedded_audio_metadata", return_value={"title": "标题"}
+            ):
+                result = audioflow.BilibiliDownloader().download("https://www.bilibili.com/video/BV1jP6LBTEbY")
+
+            self.assertEqual(len(attempts), 2)
+            self.assertEqual(result.audio_path, output)
+
     def test_xiaoyuzhou_audio_priority_fallbacks(self):
         parser = XiaoyuzhouDownloader._audio_url
         self.assertEqual(parser('<meta property="og:audio" content="https://a.test/a.m4a">'), "https://a.test/a.m4a")
@@ -414,6 +447,27 @@ class AudioFlowTest(unittest.TestCase):
                     self.assertIn("AudioFlow", body)
                     self.assertIn("开始处理", body)
                     self.assertIn("任务列表", body)
+                    self.assertIn("Summary", body)
+                    self.assertIn("details class=\"task\"", body)
+                    self.assertIn("items.splice(10)", body)
+                finally:
+                    server.shutdown()
+                    server.server_close()
+
+    def test_rest_api_detail_page(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            with patch.object(audioflow, "DATABASE_PATH", root / "audioflow.db"):
+                server = audioflow.ThreadingHTTPServer(("127.0.0.1", 0), audioflow.AudioFlowAPIHandler)
+                server.daemon_threads = True
+                thread = threading.Thread(target=server.serve_forever, daemon=True)
+                thread.start()
+                try:
+                    port = server.server_address[1]
+                    body = urlopen(f"http://127.0.0.1:{port}/view/demo-task?kind=summary", timeout=5).read().decode("utf-8")
+                    self.assertIn("返回首页", body)
+                    self.assertIn("打开原文件", body)
+                    self.assertIn("Summary", body)
                 finally:
                     server.shutdown()
                     server.server_close()

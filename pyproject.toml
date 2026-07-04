@@ -11,7 +11,7 @@ dependencies = [
     "requests>=2.31,<3",
     "rich>=13,<15",
     "typer>=0.12,<1",
-    "yt-dlp",
+    "yt-dlp-nightly",
     "faster-whisper>=1.1,<2",
 ]
 
